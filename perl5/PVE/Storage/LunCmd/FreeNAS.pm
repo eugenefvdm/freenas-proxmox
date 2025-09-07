@@ -237,7 +237,7 @@ sub run_list_extent {
     if (defined($luns->{$object})) {
         my $lu_object = $luns->{$object};
         $result = $lu_object->{$freenas_api_variables->{'extentnaa'}};
-        syslog("info",(caller(0))[3] . " '$object' wtih key '$freenas_api_variables->{'extentnaa'}' found with value: '$result'");
+        syslog("info",(caller(0))[3] . " '$object' with key '$freenas_api_variables->{'extentnaa'}' found with value: '$result'");
     } else {
         syslog("info",(caller(0))[3] . " '$object' with key '$freenas_api_variables->{'extentnaa'}' was not found");
     }
