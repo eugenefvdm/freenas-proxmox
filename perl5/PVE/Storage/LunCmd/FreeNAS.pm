@@ -383,6 +383,13 @@ sub freenas_api_connect {
         $runawayprevent++;
         $scfg->{freenas_use_ssl} = 1;
         freenas_api_connect($scfg);
+    # 404 Not Found - try v2.0 API if we're on v1.0
+    } elsif ($code == 404 && $apiping =~ /v1\.0/) {
+        syslog("info", (caller(0))[3] . " : v1.0 API returned 404, trying v2.0 API");
+        $runawayprevent++;
+        $apiping =~ s/v1\.0/v2\.0/;
+        $apiping =~ s/system\/version/system\/info/;
+        freenas_api_connect($scfg);
     # For now, any other code we fail.
     } else {
         freenas_api_log_error($freenas_server_list->{$apihost});
@@ -405,16 +412,30 @@ sub freenas_api_check {
 
     if (! defined $freenas_rest_connection->{$apihost}) {
         freenas_api_connect($scfg);
+        my $response_content = $freenas_rest_connection->responseContent();
         eval {
-            $result = decode_json($freenas_rest_connection->responseContent());
+            my $json_result = decode_json($response_content);
+            # v2.0 API returns JSON, extract version string
+            if (ref($json_result) eq 'HASH' && defined($json_result->{'version'})) {
+                $result = $json_result->{'version'};
+            } elsif (ref($json_result) eq 'HASH' && defined($json_result->{'version_string'})) {
+                $result = $json_result->{'version_string'};
+            } else {
+                # Fallback to raw content if JSON structure is unexpected
+                $result = $response_content;
+            }
         };
         if ($@) {
-            $result = $freenas_rest_connection->responseContent();
-        } else {
-            $result = $freenas_rest_connection->responseContent();
+            # Not JSON, use raw content
+            $result = $response_content;
         }
         $result =~ s/"//g;
-        syslog("info", (caller(0))[3] . " : successful : Server version: " . $result);
+        $result =~ s/^\s+|\s+$//g;  # Trim whitespace
+        syslog("info", (caller(0))[3] . " : successful : Server version: '" . $result . "'");
+        $truenas_version = undef;
+        $product_name = "Unknown";
+        $truenas_release_type = "Production";
+        
         if ($result =~ /^(TrueNAS|FreeNAS)-(\d+)\.(\d+)\-U(\d+)(?(?=\.)\.(\d+))$/) {
             $product_name = $1;
             $truenas_version = sprintf("%02d%02d%02d%02d", $2, $3 || 0, $4 || 0, $5 || 0);
@@ -426,13 +447,26 @@ sub freenas_api_check {
             $product_name = $1;
             $truenas_version = sprintf("%02d%02d%02d%02d", $2, $3 || 0, $5 || 0, $7 || 0);
             $truenas_release_type = $4 || "Production";
+        } elsif ($result =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/) {
+            # Plain version number format (e.g., "25.04.2.6") - likely v2.0 API
+            $product_name = "TrueNAS";
+            $truenas_version = sprintf("%02d%02d%02d%02d", $1, $2 || 0, $3 || 0, $4 || 0);
+            syslog("info", (caller(0))[3] . " : Detected plain version number format ($result), assuming v2.0 API");
+            $freenas_api_version = "v2.0";
+            $dev_prefix = "/dev/";
         } else {
-            $product_name = "Unknown";
-            $truenas_release_type = "Unknown";
-            syslog("error", (caller(0))[3] . " : Could not parse the version of TrueNAS.");
+            syslog("error", (caller(0))[3] . " : Could not parse the version of TrueNAS. Raw version: '" . $result . "' (length: " . length($result) . ")");
         }
-        syslog("info", (caller(0))[3] . " : ". $product_name . " Unformatted Version: " . $truenas_version);
-        if ($truenas_version >= 11030100) {
+        
+        if (defined($truenas_version)) {
+            syslog("info", (caller(0))[3] . " : ". $product_name . " Unformatted Version: " . $truenas_version);
+            if ($truenas_version >= 11030100) {
+                $freenas_api_version = "v2.0";
+                $dev_prefix = "/dev/";
+            }
+        } else {
+            # If version parsing failed but we got a response, assume v2.0 API (since v1.0 would have different format)
+            syslog("warn", (caller(0))[3] . " : Version parsing failed, defaulting to v2.0 API");
             $freenas_api_version = "v2.0";
             $dev_prefix = "/dev/";
         }
@@ -443,8 +477,13 @@ sub freenas_api_check {
         syslog("info", (caller(0))[3] . " : REST Client already initialized");
     }
     syslog("info", (caller(0))[3] . " : Using " . $product_name . " API version " . $freenas_api_version);
+    if (!defined($freenas_api_version_matrix->{$freenas_api_version})) {
+        syslog("error", (caller(0))[3] . " : Invalid API version '$freenas_api_version', defaulting to v2.0");
+        $freenas_api_version = "v2.0";
+    }
     $freenas_api_methods   = $freenas_api_version_matrix->{$freenas_api_version}->{'methods'};
     $freenas_api_variables = $freenas_api_version_matrix->{$freenas_api_version}->{'variables'};
+    syslog("info", (caller(0))[3] . " : API methods configured for version " . $freenas_api_version);
     $freenas_global_config = $freenas_global_config_list->{$apihost} = (!defined($freenas_global_config_list->{$apihost})) ? freenas_iscsi_get_globalconfiguration($scfg) : $freenas_global_config_list->{$apihost};
     return;
 }
@@ -792,14 +831,24 @@ sub freenas_get_targetid {
     my $targets   = freenas_iscsi_get_target($scfg);
     my $target_id = undef;
 
+    syslog("info", (caller(0))[3] . " : Looking for target IQN: " . (defined($scfg->{target}) ? $scfg->{target} : "undefined"));
+    my $basename = defined($freenas_global_config->{$freenas_api_variables->{'basename'}}) ? $freenas_global_config->{$freenas_api_variables->{'basename'}} : "undefined";
+    syslog("info", (caller(0))[3] . " : Global basename: " . $basename);
+
     foreach my $target (@$targets) {
         my $iqn = $freenas_global_config->{$freenas_api_variables->{'basename'}} . ':' . $target->{$freenas_api_variables->{'targetname'}};
+        syslog("info", (caller(0))[3] . " : Comparing with target IQN: $iqn");
         if($iqn eq $scfg->{target}) {
             $target_id = $target->{'id'};
+            syslog("info", (caller(0))[3] . " : Match found! Target ID: $target_id");
             last;
         }
     }
-    syslog("info", (caller(0))[3] . " : successful : $target_id");
+    if (defined($target_id)) {
+        syslog("info", (caller(0))[3] . " : successful : $target_id");
+    } else {
+        syslog("warn", (caller(0))[3] . " : No matching target found for IQN: " . (defined($scfg->{target}) ? $scfg->{target} : "undefined"));
+    }
     return $target_id;
 }
 
