@@ -661,7 +661,13 @@ sub freenas_iscsi_create_target_to_extent {
 
     my $post_body = {};
     while ((my $key, my $value) = each %{$freenas_api_methods->{'targetextent'}->{'post_body'}}) {
-        $post_body->{$key} = ($value =~ /^\$.+$/) ? eval $value : $value;
+        my $eval_value = ($value =~ /^\$.+$/) ? eval $value : $value;
+        # Ensure numeric fields are integers for v2.0 API
+        if ($freenas_api_version eq "v2.0" && ($key eq 'target' || $key eq 'extent' || $key eq 'lunid')) {
+            $post_body->{$key} = int($eval_value);
+        } else {
+            $post_body->{$key} = $eval_value;
+        }
     }
 
     freenas_api_call($scfg, 'POST', $freenas_api_methods->{'targetextent'}->{'resource'}, $post_body);
